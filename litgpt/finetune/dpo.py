@@ -1,4 +1,5 @@
 # Copyright Lightning AI. Licensed under the Apache License 2.0, see LICENSE file.
+from collections import defaultdict
 import dataclasses
 import math
 import os
@@ -59,17 +60,17 @@ def setup(
     lora_head: bool = False,
     data: Optional[DataModule] = None,
     train: TrainArgs = TrainArgs(
-        save_interval=1000,
+        save_interval=100,
         log_interval=1,
         global_batch_size=16,
         micro_batch_size=4,
         lr_warmup_steps=100,
         epochs=5,
         learning_rate=5e-4,
-        max_seq_length=None,
+        max_seq_length=512,
     ),
     eval: EvalArgs = EvalArgs(interval=100, max_new_tokens=100, max_iters=100),
-    logger_name: Literal["wandb", "tensorboard", "csv"] = "csv",
+    logger_name: Literal["wandb", "tensorboard", "csv"] = "wandb", #"csv",
     seed: int = 1337,
 ) -> None:
     """Finetune a model using the LoRA method.
@@ -189,30 +190,20 @@ def main(
 
     
     ref_model = fabric.setup_module(ref_model)
+    ref_model.eval()
 
-    #trainable_params = [p for p in model.parameters() if p.requires_grad]
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.RMSprop(trainable_params, lr=train.learning_rate)
 
-    '''
-    if isinstance(fabric.strategy.precision, BitsandbytesPrecision):
-        import bitsandbytes as bnb
-
-        optimizer_cls = bnb.optim.PagedAdamW
-    else:
-        optimizer_cls = torch.optim.AdamW
-    optimizer = optimizer_cls(
-        trainable_params, lr=train.learning_rate, weight_decay=train.weight_decay, betas=(train.beta1, train.beta2)
-    )
-    optimizer = fabric.setup_optimizers(optimizer)
-    '''
-    optimizer = torch.optim.RMSprop(model.parameters(), lr=train.learning_rate)
     model, optimizer = fabric.setup(model, optimizer)
+
     scheduler = get_lr_scheduler(optimizer, warmup_steps=train.lr_warmup_steps, max_steps=lr_max_steps)
 
     # strict=False because missing keys due to LoRA weights not contained in state dict
     load_checkpoint(fabric, model, checkpoint_path, strict=False)
     load_checkpoint(fabric, ref_model, checkpoint_path, strict=False)
     
-    ref_model = ref_model.eval()
+    
 
     train_time = time.perf_counter()
     fit(
@@ -340,10 +331,14 @@ def fit(
                    "reference_free":False,    
                    }
     
+    
+
     while step_count < max_steps and train_iterator.epoch < train.epochs:
         iter_num += 1
         iter_t0 = time.perf_counter()
         batch = next(train_iterator)
+        
+        batch_metrics = defaultdict(list)
 
         is_accumulating = iter_num % train.gradient_accumulation_iters(devices) != 0
         with fabric.no_backward_sync(model, enabled=is_accumulating):
@@ -351,6 +346,9 @@ def fit(
             loss, metrics = get_batch_metrics(fabric, model, ref_model, batch, loss_config, train=True)
 
             fabric.backward(loss / train.gradient_accumulation_iters(devices))
+
+            for k, v in metrics.items():
+                batch_metrics[k].extend(v)
 
         running_loss.update(loss.detach())
         
@@ -368,6 +366,8 @@ def fit(
                 time=t1 - total_t0, batches=iter_num, samples=iter_num * train.micro_batch_size, lengths=total_lengths
             )
             throughput.compute_and_log(step=iter_num)
+            batch_metrics = {k: sum(v) / len(v) for k, v in batch_metrics.items()}
+            #print(batch_metrics)
             metrics = {
                 "loss": loss,
                 "iter": iter_num,
@@ -377,7 +377,7 @@ def fit(
                 "tokens": iter_num * train.micro_batch_size * model.config.block_size,
                 "total_tokens": (iter_num * train.micro_batch_size * model.config.block_size * fabric.world_size),
                 "learning_rate": scheduler.get_last_lr()[0],
-                **metrics
+                **batch_metrics,
             }
             if isinstance(val_loss, torch.Tensor):
                 val_loss = f"{val_loss:.3f}"
@@ -577,12 +577,12 @@ def validate(
 
     val_loss = losses.mean()
 
-    '''
+    
     # produce an example:
     instruction = "Recommend a movie for me to watch during the weekend and explain the reason."
-    fabric.print(instruction)
+    #fabric.print(instruction)
     prompt = data.prompt_style.apply(instruction)
-    print(prompt)
+    #fabric.print(prompt)
     encoded = tokenizer.encode(prompt, device=fabric.device)
     with fabric.init_tensor():
         # do not set `max_seq_length=max_returned_token` because memory is not a concern here
@@ -594,17 +594,13 @@ def validate(
     model.clear_kv_cache()
     output = tokenizer.decode(output)
     fabric.print(output)
-    '''
+    
     model.train()
 
     return val_loss
 
 
 def get_lr_scheduler(optimizer, warmup_steps: int, max_steps: int):
-    # linear warmup followed by cosine annealing
-    #scheduler1 = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: step / warmup_steps)
-    #scheduler2 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=(max_steps - warmup_steps))
-    #return torch.optim.lr_scheduler.SequentialLR(optimizer, [scheduler1, scheduler2], milestones=[warmup_steps])
     return torch.optim.lr_scheduler.LambdaLR(
         optimizer, lr_lambda=(lambda step: min(1.0, (step + 1) / (warmup_steps + 1)))
     )
