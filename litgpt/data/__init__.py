@@ -1,6 +1,6 @@
 # Copyright Lightning AI. Licensed under the Apache License 2.0, see LICENSE file.
 
-from litgpt.data.base import DataModule, SFTDataset, get_sft_collate_fn, DPODataset, get_dpo_collate_fn
+from litgpt.data.base import DataModule, SFTDataset, get_sft_collate_fn, DPODataset
 from litgpt.data.alpaca import Alpaca
 from litgpt.data.alpaca_2k import Alpaca2k
 from litgpt.data.alpaca_gpt4 import AlpacaGPT4
