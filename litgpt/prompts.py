@@ -55,6 +55,11 @@ class Alpaca(PromptStyle):
             f"### Instruction:\n{prompt}\n\n### Response:\n"
         )
 
+class Stack(PromptStyle):
+    def apply(self, prompt: str, **kwargs: str) -> str:
+        return "Question: " + prompt + "\n\nAnswer: "
+
+
 
 class FLAN(PromptStyle):
     def apply(self, prompt: str, **kwargs: str) -> str:
@@ -294,6 +299,7 @@ prompt_styles: Dict[str, Type[PromptStyle]] = {
     "phi-2": Phi2,
     "tinyllama": TinyLlama,
     "gemma": Gemma,
+    "stack": Stack,
 }
 
 

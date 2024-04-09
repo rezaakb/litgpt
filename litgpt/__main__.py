@@ -8,6 +8,7 @@ from litgpt.chat.base import main as chat_fn
 from litgpt.finetune.adapter import setup as finetune_adapter_fn
 from litgpt.finetune.adapter_v2 import setup as finetune_adapter_v2_fn
 from litgpt.finetune.full import setup as finetune_full_fn
+from litgpt.finetune.dpo import setup as finetune_dpo_fn
 from litgpt.finetune.lora import setup as finetune_lora_fn
 from litgpt.generate.adapter import main as generate_adapter_fn
 from litgpt.generate.adapter_v2 import main as generate_adapter_v2_fn
@@ -23,7 +24,6 @@ from litgpt.scripts.convert_pretrained_checkpoint import (
 )
 from litgpt.scripts.download import download_from_hub as download_fn
 from litgpt.scripts.merge_lora import merge_lora as merge_lora_fn
-from litgpt.eval.evaluate import convert_and_evaluate as evaluate_fn
 
 if TYPE_CHECKING:
     from jsonargparse import ArgumentParser
@@ -49,6 +49,7 @@ def main() -> None:
             "full": {"help": "Finetune a model.", "fn": finetune_full_fn},
             "adapter": {"help": "Finetune a model with Adapter.", "fn": finetune_adapter_fn},
             "adapter_v2": {"help": "Finetune a model with Adapter v2.", "fn": finetune_adapter_v2_fn},
+            "dpo": {"help": "Pretrain a model.", "fn": finetune_dpo_fn},
         },
         "pretrain": {"help": "Pretrain a model.", "fn": pretrain_fn},
         "generate": {
@@ -79,7 +80,6 @@ def main() -> None:
             },
         },
         "merge_lora": {"help": "Merges the LoRA weights with the base model.", "fn": merge_lora_fn},
-        "evaluate": {"help": "Evaluate a model with the LM Evaluation Harness.", "fn": evaluate_fn},
     }
 
     from jsonargparse import set_config_read_mode, set_docstring_parse_options
