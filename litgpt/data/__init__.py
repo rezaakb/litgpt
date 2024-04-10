@@ -16,6 +16,8 @@ from litgpt.data.tinystories import TinyStories
 from litgpt.data.openwebtext import OpenWebText
 from litgpt.data.stackoverflow import StackExchange
 from litgpt.data.openfoam import OpenFOAM
+from litgpt.data.hh import HH
+
 
 
 
@@ -38,4 +40,5 @@ __all__ = [
     "get_sft_collate_fn",
     "StackExchange",
     "OpenFOAM",
+    "HH",
 ]

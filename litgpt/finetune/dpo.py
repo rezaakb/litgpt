@@ -18,7 +18,7 @@ from lightning.fabric.utilities import ThroughputMonitor
 from torch.utils.data import DataLoader
 from torchmetrics import RunningMean
 
-from litgpt.args import EvalArgs, TrainArgs
+from litgpt.args import EvalArgs, TrainArgs, DPOArgs
 from litgpt.data import Alpaca, DataModule
 from litgpt.generate.base import generate
 from litgpt.lora import GPT, Block, Config, lora_filter, mark_only_lora_as_trainable
@@ -39,9 +39,7 @@ from litgpt.utils import (
     save_hyperparameters,
 )
 
-import transformers
 from transformers import AutoTokenizer
-from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
 
 def setup(
     checkpoint_dir: Path = Path("checkpoints/stabilityai/stablelm-base-alpha-3b"),
@@ -60,16 +58,18 @@ def setup(
     lora_head: bool = False,
     data: Optional[DataModule] = None,
     train: TrainArgs = TrainArgs(
-        save_interval=100,
+        save_interval=10,
         log_interval=1,
         global_batch_size=16,
         micro_batch_size=4,
         lr_warmup_steps=100,
-        epochs=5,
-        learning_rate=5e-4,
+        epochs=100,
+        learning_rate=5e-5,
         max_seq_length=512,
+        max_steps = 50000,
     ),
     eval: EvalArgs = EvalArgs(interval=100, max_new_tokens=100, max_iters=100),
+    dpo: DPOArgs = DPOArgs(),
     logger_name: Literal["wandb", "tensorboard", "csv"] = "wandb", #"csv",
     seed: int = 1337,
 ) -> None:
@@ -93,6 +93,7 @@ def setup(
         data: Data-related arguments. If not provided, the default is ``litgpt.data.Alpaca``.
         train: Training-related arguments. See ``litgpt.args.TrainArgs`` for details.
         eval: Evaluation-related arguments. See ``litgpt.args.EvalArgs`` for details.
+        dpo: DPO-related arguments. See ``litgpt.args.DPOArgs`` for details.
         logger_name: The name of the logger to send metrics to.
         seed: The random seed to use for reproducibility.
     """
@@ -143,7 +144,7 @@ def setup(
         strategy = "auto"
 
     fabric = L.Fabric(devices=devices, strategy=strategy, precision=precision, loggers=logger, plugins=plugins)
-    fabric.launch(main, devices, seed, config, data, checkpoint_dir, out_dir, train, eval)
+    fabric.launch(main, devices, seed, config, data, checkpoint_dir, out_dir, train, eval, dpo)
 
 
 def main(
@@ -156,12 +157,11 @@ def main(
     out_dir: Path,
     train: TrainArgs,
     eval: EvalArgs,
+    dpo: DPOArgs,
 ) -> None:
-    validate_args(train, eval)
+    validate_args(train, eval, dpo)
 
-    #tokenizer = Tokenizer(checkpoint_dir)
-
-    tokenizer = AutoTokenizer.from_pretrained('meta-llama/Llama-2-7b-hf')
+    tokenizer = AutoTokenizer.from_pretrained(str(checkpoint_dir.relative_to(*checkpoint_dir.parts[:-2])))
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
@@ -219,6 +219,7 @@ def main(
         out_dir,
         train,
         eval,
+        dpo,
         data,
     )
 
@@ -293,8 +294,10 @@ def fit(
     out_dir: Path,
     train: TrainArgs,
     eval: EvalArgs,
+    dpo: DPOArgs,
     data: DataModule,
 ) -> None:
+    
     tokenizer = Tokenizer(checkpoint_dir)
     #longest_seq_length, longest_seq_ix = get_longest_seq_length(train_dataloader.dataset)
 
@@ -310,7 +313,7 @@ def fit(
         f" {model.max_seq_length} and context length is {model.config.block_size}"
     )
 
-    validate(fabric, model, ref_model, val_dataloader, tokenizer, dataclasses.replace(eval, max_iters=2), data)  # sanity check
+    validate(fabric, model, ref_model, val_dataloader, tokenizer, dataclasses.replace(eval, max_iters=2), dpo, data)  # sanity check
 
     train_iterator = CycleIterator(train_dataloader)
     throughput = ThroughputMonitor(fabric, window_size=50)
@@ -325,14 +328,6 @@ def fit(
     
     val_loss = "n/a"
     
-    loss_config = {"name": "dpo",
-                   "beta":0.1,
-                   "label_smoothing":0,
-                   "reference_free":False,    
-                   }
-    
-    
-
     while step_count < max_steps and train_iterator.epoch < train.epochs:
         iter_num += 1
         iter_t0 = time.perf_counter()
@@ -343,7 +338,7 @@ def fit(
         is_accumulating = iter_num % train.gradient_accumulation_iters(devices) != 0
         with fabric.no_backward_sync(model, enabled=is_accumulating):
          
-            loss, metrics = get_batch_metrics(fabric, model, ref_model, batch, loss_config, train=True)
+            loss, metrics = get_batch_metrics(fabric, model, ref_model, batch, dpo, train=True)
 
             fabric.backward(loss / train.gradient_accumulation_iters(devices))
 
@@ -367,7 +362,7 @@ def fit(
             )
             throughput.compute_and_log(step=iter_num)
             batch_metrics = {k: sum(v) / len(v) for k, v in batch_metrics.items()}
-            #print(batch_metrics)
+
             metrics = {
                 "loss": loss,
                 "iter": iter_num,
@@ -379,6 +374,7 @@ def fit(
                 "learning_rate": scheduler.get_last_lr()[0],
                 **batch_metrics,
             }
+
             if isinstance(val_loss, torch.Tensor):
                 val_loss = f"{val_loss:.3f}"
             fabric.print(
@@ -392,10 +388,10 @@ def fit(
 
         if not is_accumulating and step_count % eval.interval == 0:
             t0 = time.perf_counter()
-            val_loss = validate(fabric, model, ref_model, val_dataloader, tokenizer, eval, data)
+            val_loss, metrics_val = validate(fabric, model, ref_model, val_dataloader, tokenizer, eval, dpo, data)
             t1 = time.perf_counter() - t0
             fabric.print(f"iter {iter_num}: val loss {val_loss.item():.4f}, val time: {t1 * 1000:.2f} ms")
-            metrics = {"val_loss": val_loss, "val_ppl": math.exp(val_loss)}
+            metrics = {"val_loss": val_loss, "val_ppl": math.exp(val_loss), **metrics_val}
             fabric.log_dict(metrics, step=iter_num)
             fabric.barrier()
 
@@ -500,17 +496,17 @@ def get_batch_metrics(fabric, policy, reference_model, batch: Dict[str, Union[Li
     metrics = {}
     train_test = 'train' if train else 'eval'
 
-    if loss_config['name'] in {'dpo', 'ipo'}:
+    if loss_config.name in {'dpo', 'ipo'}:
         policy_chosen_logps, policy_rejected_logps = concatenated_forward(policy, batch)
         with torch.no_grad():
             reference_chosen_logps, reference_rejected_logps = concatenated_forward(reference_model, batch)
 
-        if loss_config['name'] == 'dpo':
-            loss_kwargs = {'beta': loss_config['beta'], 'reference_free': loss_config['reference_free'], 'label_smoothing': loss_config['label_smoothing'], 'ipo': False}
-        elif loss_config['name'] == 'ipo':
-            loss_kwargs = {'beta': loss_config['beta'], 'ipo': True}
+        if loss_config.name == 'dpo':
+            loss_kwargs = {'beta': loss_config.beta, 'reference_free': loss_config.reference_free, 'label_smoothing': loss_config.label_smoothing, 'ipo': False}
+        elif loss_config.name == 'ipo':
+            loss_kwargs = {'beta': loss_config.beta, 'ipo': True}
         else:
-            raise ValueError(f'unknown loss {loss_config["name"]}')
+            raise ValueError(f'unknown loss {loss_config.name}')
 
         losses, chosen_rewards, rejected_rewards = preference_loss(
             policy_chosen_logps, policy_rejected_logps, reference_chosen_logps, reference_rejected_logps, **loss_kwargs)
@@ -529,7 +525,7 @@ def get_batch_metrics(fabric, policy, reference_model, batch: Dict[str, Union[Li
         policy_rejected_logps = fabric.all_gather(policy_rejected_logps.detach()) #all_gather_if_needed(policy_rejected_logps.detach(), self.rank, self.world_size)
         metrics[f'logps_{train_test}/rejected'] = policy_rejected_logps.cpu().numpy().tolist()
 
-    elif loss_config['name'] == 'sft':
+    elif loss_config.name == 'sft':
         policy_chosen_logits = policy(batch['chosen_input_ids'], attention_mask=batch['chosen_attention_mask']).logits.to(torch.float32)
         policy_chosen_logps = _get_batch_logps(policy_chosen_logits, batch['chosen_labels'], average_log_prob=False)
 
@@ -554,35 +550,31 @@ def validate(
     val_dataloader: DataLoader,
     tokenizer: Tokenizer,
     eval: EvalArgs,
+    dpo: DPOArgs,
     data: DataModule
 ) -> torch.Tensor:
     fabric.print("Validating ...")
     model.eval()
 
-    loss_config = {"name": "dpo",
-                   "beta":0.1,
-                   "label_smoothing":0,
-                   "reference_free":False}
-
     losses = torch.zeros(min(len(val_dataloader), eval.max_iters))
+    
+    all_eval_metrics = defaultdict(list)
+
     for k, batch in enumerate(val_dataloader):
         if k >= eval.max_iters:
             break
 
-        losses, eval_metrics = get_batch_metrics(fabric, model, ref_model, batch, loss_config, train=False)
+        losses, eval_metrics = get_batch_metrics(fabric, model, ref_model, batch, dpo, train=False)
         
-        #input_ids, targets = batch["input_ids"], batch["labels"]
-        #logits = model(input_ids)
-        #losses[k] = chunked_cross_entropy(logits[..., :-1, :], targets[..., 1:], chunk_size=0)
-
+        for k, v in eval_metrics.items():
+            all_eval_metrics[k].extend(v)
+        
     val_loss = losses.mean()
-
+    mean_eval_metrics = {k: sum(v) / len(v) for k, v in all_eval_metrics.items()}
     
     # produce an example:
     instruction = "Recommend a movie for me to watch during the weekend and explain the reason."
-    #fabric.print(instruction)
     prompt = data.prompt_style.apply(instruction)
-    #fabric.print(prompt)
     encoded = tokenizer.encode(prompt, device=fabric.device)
     with fabric.init_tensor():
         # do not set `max_seq_length=max_returned_token` because memory is not a concern here
@@ -597,7 +589,7 @@ def validate(
     
     model.train()
 
-    return val_loss
+    return val_loss, mean_eval_metrics
 
 
 def get_lr_scheduler(optimizer, warmup_steps: int, max_steps: int):
@@ -621,7 +613,6 @@ def get_dataloaders(
 
 def get_longest_seq_length(data: List[Dict]) -> Tuple[int, int]:
     # find out the minimum max_seq_length required during fine-tuning (saves memory!)
-    print(data)
     lengths = [len(d["prompt"]) + len(d["chosen"]) for d in data]
     longest_seq_length = max(lengths)
     longest_seq_ix = lengths.index(longest_seq_length)
@@ -633,7 +624,7 @@ def save_lora_checkpoint(fabric: L.Fabric, model: torch.nn.Module, file_path: Pa
     fabric.save(file_path, {"model": model}, filter={"model": lora_filter})
 
 
-def validate_args(train: TrainArgs, eval: EvalArgs) -> None:
+def validate_args(train: TrainArgs, eval: EvalArgs, dpo: DPOArgs) -> None:
     issues = []
     unsupported = [(train, ["max_tokens", "max_norm", "tie_embeddings", "lr_warmup_fraction"])]
     for args, names in unsupported:

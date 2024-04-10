@@ -127,6 +127,7 @@ class DPODataset(Dataset):
         transform: Optional[Callable[[Any], Any]] = None,
         chosen_str: str = "response_j",
         rejected_str: str = "response_k",
+        truncation_mode = 'keep_start',
     ) -> None:
         self.data = data
         self.tokenizer = tokenizer
@@ -140,6 +141,7 @@ class DPODataset(Dataset):
         self.max_prompt_length = max_prompt_length
         self.chosen_str = chosen_str
         self.rejected_str = rejected_str
+        self.truncation_mode = truncation_mode
 
     def __len__(self) -> int:
         return len(self.data)
@@ -157,7 +159,7 @@ class DPODataset(Dataset):
         batch_element = tokenize_batch_element(prompt=prompt,
                                                chosen=example[self.chosen_str],
                                                rejected=example[self.rejected_str],
-                                               truncation_mode='keep_start', # We should fix it for hh dataset.
+                                               truncation_mode=self.truncation_mode, # We should fix it for hh dataset.
                                                tokenizer=self.tokenizer,
                                                max_length=self.max_seq_length,
                                                max_prompt_length=self.max_prompt_length)

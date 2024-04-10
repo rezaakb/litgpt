@@ -79,3 +79,14 @@ class EvalArgs:
     """Number of tokens to generate"""
     max_iters: int = 100
     """Number of iterations"""
+
+
+@dataclass
+class DPOArgs:
+    """DPO-related arguments"""
+
+    name: str = "dpo"
+    beta: float = 0.1
+    max_iters: int = 100
+    label_smoothing: float = 0
+    reference_free: bool = False

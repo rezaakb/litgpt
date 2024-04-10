@@ -152,7 +152,8 @@ def get_hh(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str,
         rejected_response = ex['rejected'][len(prompt):]
         return prompt, chosen_response, rejected_response
 
-    data = defaultdict(lambda: defaultdict(list))
+    data = []
+    '''
     for row in tqdm.tqdm(dataset, desc='Processing HH', disable=silent):
         prompt, chosen, rejected = split_prompt_and_responses(row)
         responses = [chosen, rejected]
@@ -160,6 +161,14 @@ def get_hh(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str,
         data[prompt]['pairs'].append((n_responses, n_responses + 1))
         data[prompt]['responses'].extend(responses)
         data[prompt]['sft_target'] = chosen
+    '''
+
+    for row in tqdm.tqdm(dataset, desc='Processing HH', disable=silent):
+        prompt, chosen, rejected = split_prompt_and_responses(row)
+
+        data.append({'question': prompt,
+                     'chosen': chosen,
+                     'rejected': rejected})
 
     return data
 

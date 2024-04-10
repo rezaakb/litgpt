@@ -300,6 +300,7 @@ prompt_styles: Dict[str, Type[PromptStyle]] = {
     "tinyllama": TinyLlama,
     "gemma": Gemma,
     "stack": Stack,
+    "default": Default,
 }
 
 
