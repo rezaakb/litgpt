@@ -58,15 +58,15 @@ def setup(
     lora_head: bool = False,
     data: Optional[DataModule] = None,
     train: TrainArgs = TrainArgs(
-        save_interval=10,
+        save_interval=100,
         log_interval=1,
-        global_batch_size=16,
-        micro_batch_size=4,
-        lr_warmup_steps=100,
-        epochs=100,
-        learning_rate=5e-5,
+        global_batch_size=64,
+        micro_batch_size=32,
+        lr_warmup_steps=150,
+        epochs=1,
+        learning_rate=5e-7,
         max_seq_length=512,
-        max_steps = 50000,
+        max_steps = 500000,
     ),
     eval: EvalArgs = EvalArgs(interval=100, max_new_tokens=100, max_iters=100),
     dpo: DPOArgs = DPOArgs(),
@@ -114,6 +114,9 @@ def setup(
         lora_projection=lora_projection,
         lora_mlp=lora_mlp,
         lora_head=lora_head,
+    )
+    config_ref = Config.from_file(
+        checkpoint_dir / "model_config.yaml",
     )
 
     precision = precision or get_default_supported_precision(training=True)
@@ -177,20 +180,24 @@ def main(
     checkpoint_path = checkpoint_dir / "lit_model.pth"
     
     with fabric.init_module(empty_init=(devices > 1)):
-        ref_model = GPT(config)
+        if dpo.name == 'sft':
+            ref_model = None
+        else:
+            ref_model = GPT(config_ref)
         model = GPT(config)
 
     disable_dropout(model)
-    disable_dropout(ref_model)
+    if dpo.name != 'sft':
+        disable_dropout(ref_model)
     
     mark_only_lora_as_trainable(model)
 
     fabric.print(f"Number of trainable parameters: {num_parameters(model, requires_grad=True):,}")
     fabric.print(f"Number of non-trainable parameters: {num_parameters(model, requires_grad=False):,}")
 
-    
-    ref_model = fabric.setup_module(ref_model)
-    ref_model.eval()
+    if dpo.name != 'sft':
+        ref_model = fabric.setup_module(ref_model)
+        ref_model.eval()
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.RMSprop(trainable_params, lr=train.learning_rate)
@@ -201,7 +208,8 @@ def main(
 
     # strict=False because missing keys due to LoRA weights not contained in state dict
     load_checkpoint(fabric, model, checkpoint_path, strict=False)
-    load_checkpoint(fabric, ref_model, checkpoint_path, strict=False)
+    if dpo.name != 'sft':
+        load_checkpoint(fabric, ref_model, checkpoint_path, strict=False)
     
     
 
@@ -303,11 +311,16 @@ def fit(
 
     #tokenizer = AutoTokenizer.from_pretrained('meta-llama/Llama-2-7b-hf')
 
-    ref_model.eval()
+    
 
     longest_seq_length = 512
+    
     model.max_seq_length = train_dataloader.dataset.max_seq_length #min(longest_seq_length, train.max_seq_length or float("inf"))
     
+    if dpo.name != 'sft':
+        ref_model.max_seq_length = train_dataloader.dataset.max_seq_length
+        ref_model.eval()
+        
     fabric.print(
         f"The longest sequence length in the train data is {longest_seq_length}, the model's maximum sequence length is"
         f" {model.max_seq_length} and context length is {model.config.block_size}"
@@ -526,7 +539,7 @@ def get_batch_metrics(fabric, policy, reference_model, batch: Dict[str, Union[Li
         metrics[f'logps_{train_test}/rejected'] = policy_rejected_logps.cpu().numpy().tolist()
 
     elif loss_config.name == 'sft':
-        policy_chosen_logits = policy(batch['chosen_input_ids'], attention_mask=batch['chosen_attention_mask']).logits.to(torch.float32)
+        policy_chosen_logits = policy(batch['chosen_input_ids']).to(torch.float32)
         policy_chosen_logps = _get_batch_logps(policy_chosen_logits, batch['chosen_labels'], average_log_prob=False)
 
         losses = -policy_chosen_logps
@@ -574,7 +587,8 @@ def validate(
     
     # produce an example:
     instruction = "Recommend a movie for me to watch during the weekend and explain the reason."
-    prompt = data.prompt_style.apply(instruction)
+    prompt = f'\n\nHuman: {instruction}\n\nAssistant:'
+    #prompt = data.prompt_style.apply(instruction)
     encoded = tokenizer.encode(prompt, device=fabric.device)
     with fabric.init_tensor():
         # do not set `max_seq_length=max_returned_token` because memory is not a concern here
